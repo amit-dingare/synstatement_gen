@@ -76,13 +76,18 @@ class RealisticDataGenerator:
             "adjustment": {"prefix": "ADJ", "is_debit": None},
         }
 
-        self.descriptions = [
+        # Separate descriptions by debit/credit nature
+        self.debit_descriptions = [
             "Product delivery", "Service charges", "Shipping and handling",
             "Monthly supplies", "Equipment rental", "Maintenance fees",
             "Raw materials", "Packaging supplies", "Quality inspection",
             "Storage fees", "Transportation", "Processing charges",
+        ]
+
+        self.credit_descriptions = [
             "Damage claim", "Returned goods", "Price adjustment",
             "Volume discount", "Early payment discount", "Late fee waiver",
+            "Overpayment refund", "Credit memo", "Settlement discount",
         ]
 
     def generate_company(self):
@@ -116,8 +121,14 @@ class RealisticDataGenerator:
         """Generate realistic customer data"""
         return random.choice(self.customers)
 
-    def generate_transactions(self, num_transactions=10, opening_balance=0):
-        """Generate realistic transaction flow"""
+    def generate_transactions(self, num_transactions=10, opening_balance=0, statement_style='straight'):
+        """Generate realistic transaction flow
+
+        Args:
+            num_transactions: Number of transactions to generate
+            opening_balance: Starting balance
+            statement_style: 'straight' or 'cumulative' - affects how balances are displayed
+        """
         transactions = []
         current_balance = Decimal(str(opening_balance))
         base_date = datetime.now() - timedelta(days=90)
@@ -150,16 +161,20 @@ class RealisticDataGenerator:
                 amount = Decimal(str(random.uniform(10, 500))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                 current_balance += amount
 
+            # Choose description based on whether transaction is debit or credit
+            is_credit_trans = not type_info['is_debit'] if type_info['is_debit'] is not None else random.choice([True, False])
+            description = random.choice(self.credit_descriptions if is_credit_trans else self.debit_descriptions)
+
             transactions.append({
                 "date": trans_date.strftime("%d/%m/%Y"),
                 "date_obj": trans_date,
                 "type": trans_type,
                 "reference": reference,
-                "description": random.choice(self.descriptions),
+                "description": description,
                 "amount": float(amount),
                 "balance_after": float(current_balance),
-                "is_credit": not type_info['is_debit'] if type_info['is_debit'] is not None else random.choice([True, False]),
-                "is_debit": type_info['is_debit'] if type_info['is_debit'] is not None else random.choice([True, False]),
+                "is_credit": is_credit_trans,
+                "is_debit": type_info['is_debit'] if type_info['is_debit'] is not None else not is_credit_trans,
                 "po_number": f"PO{random.randint(100000, 999999)}" if random.random() > 0.3 else "",
                 "due_date": (trans_date + timedelta(days=30)).strftime("%d/%m/%Y"),
             })
@@ -169,12 +184,40 @@ class RealisticDataGenerator:
 
         # Recalculate balances after sorting
         current_balance = Decimal(str(opening_balance))
-        for trans in transactions:
-            if trans["is_debit"]:
-                current_balance += Decimal(str(trans["amount"]))
-            else:
-                current_balance -= Decimal(str(trans["amount"]))
-            trans["balance_after"] = float(current_balance)
+
+        if statement_style == 'cumulative':
+            # For cumulative style: opening balance is embedded in the first transaction's amount
+            # First transaction: amount = opening_balance +/- original_amount, and amount = balance_after
+            # This way, no separate opening balance row is needed and first row amount matches balance
+            if transactions:
+                first_trans = transactions[0]
+                original_amount = Decimal(str(first_trans["amount"]))
+                opening_bal_decimal = Decimal(str(opening_balance))
+
+                # Adjust first transaction amount to include opening balance
+                if first_trans["is_debit"]:
+                    first_trans["amount"] = float(opening_bal_decimal + original_amount)
+                else:
+                    first_trans["amount"] = float(opening_bal_decimal - original_amount)
+
+                current_balance = Decimal(str(first_trans["amount"]))
+                first_trans["balance_after"] = float(current_balance)
+
+                # Process remaining transactions normally
+                for trans in transactions[1:]:
+                    if trans["is_debit"]:
+                        current_balance += Decimal(str(trans["amount"]))
+                    else:
+                        current_balance -= Decimal(str(trans["amount"]))
+                    trans["balance_after"] = float(current_balance)
+        else:
+            # Straight style: normal balance calculation
+            for trans in transactions:
+                if trans["is_debit"]:
+                    current_balance += Decimal(str(trans["amount"]))
+                else:
+                    current_balance -= Decimal(str(trans["amount"]))
+                trans["balance_after"] = float(current_balance)
 
         return transactions, float(current_balance)
 
@@ -328,18 +371,32 @@ class StatementPDFGenerator:
 
         story.append(Spacer(1, 0.3*inch))
 
-        # Transaction table
-        table_data = [['DATE', 'DESCRIPTION', 'AMOUNT', 'OPEN AMOUNT']]
+        # Transaction table - include reference number in description
+        table_data = [['DATE', 'REFERENCE', 'DESCRIPTION', 'AMOUNT', 'OUTSTANDING']]
+
+        # Add opening balance row if it exists and is non-zero (only for straight style)
+        opening_balance = statement_data.get('opening_balance', 0)
+        statement_style = statement_data.get('statement_style', 'straight')
+        if opening_balance > 0.01 and statement_style == 'straight':
+            table_data.append([
+                '',
+                '',
+                'Opening Balance',
+                '',
+                f"{opening_balance:,.2f}"
+            ])
+
         for trans in statement_data['transactions']:
             amount = trans['amount'] if trans['is_debit'] else -trans['amount']
             table_data.append([
                 trans['date'],
+                trans['reference'],
                 trans['description'],
                 f"{amount:,.2f}",
                 f"{trans['balance_after']:,.2f}"
             ])
 
-        trans_table = Table(table_data, colWidths=[1.2*inch, 3*inch, 1.3*inch, 1.3*inch])
+        trans_table = Table(table_data, colWidths=[0.9*inch, 1.1*inch, 2.3*inch, 1*inch, 1.3*inch])
         trans_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E0E0E0')),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
@@ -452,6 +509,19 @@ class StatementPDFGenerator:
 
         # Transaction table with green header
         table_data = [['DOCUMENT NUMBER', 'DOCUMENT DATE', 'Type', 'REFERENCE/APPLIED NUMBER', 'DUE DATE', 'AMOUNT']]
+
+        # Add opening balance row if it exists and is non-zero (only for straight style)
+        opening_balance = statement_data.get('opening_balance', 0)
+        statement_style = statement_data.get('statement_style', 'straight')
+        if opening_balance > 0.01 and statement_style == 'straight':
+            table_data.append([
+                'OPENING',
+                statement_data['statement_date'],
+                'OB',
+                'Opening Balance',
+                '',
+                f"{opening_balance:,.2f}"
+            ])
 
         type_map = {
             'invoice': 'IN',
@@ -584,26 +654,36 @@ UC - Unapplied Cash    RF - Refund"""
         story.append(Spacer(1, 0.3*inch))
 
         # Transaction table with Debit/Credit columns
-        table_data = [['Invoice', 'Invoice Date', 'Debit', 'Credit', 'Balance']]
+        table_data = [['Reference', 'Date', 'Debit', 'Credit', 'Outstanding']]
 
-        running_balance = Decimal('0')
+        # Add opening balance row if it exists and is non-zero (only for straight style)
+        opening_balance = statement_data.get('opening_balance', 0)
+        statement_style = statement_data.get('statement_style', 'straight')
+        if opening_balance > 0.01 and statement_style == 'straight':
+            table_data.append([
+                'OPENING',
+                '',
+                '',
+                '',
+                f"{opening_balance:,.2f}"
+            ])
+
+        # Use pre-calculated balance_after from transactions
         for trans in statement_data['transactions']:
             debit_str = ""
             credit_str = ""
 
             if trans['is_debit']:
                 debit_str = f"{trans['amount']:,.2f}"
-                running_balance += Decimal(str(trans['amount']))
             else:
                 credit_str = f"{trans['amount']:,.2f}"
-                running_balance -= Decimal(str(trans['amount']))
 
             table_data.append([
                 trans['reference'],
                 trans['date'],
                 debit_str,
                 credit_str,
-                f"{float(running_balance):,.2f}"
+                f"{trans['balance_after']:,.2f}"
             ])
 
         trans_table = Table(table_data, colWidths=[1.4*inch, 1.2*inch, 1.3*inch, 1.3*inch, 1.6*inch])
@@ -713,8 +793,33 @@ UC - Unapplied Cash    RF - Refund"""
         # Transaction table
         table_data = [['Date', 'Description', 'Invoice #', 'PO#', 'Terms', 'Amount', 'Outstanding']]
 
+        # Add opening balance row if it exists and is non-zero (only for straight style)
+        opening_balance = statement_data.get('opening_balance', 0)
+        statement_style = statement_data.get('statement_style', 'straight')
+        if opening_balance > 0.01 and statement_style == 'straight':
+            table_data.append([
+                '',
+                'Opening Balance',
+                '',
+                '',
+                '',
+                '',
+                f"{opening_balance:,.2f}"
+            ])
+
         for trans in statement_data['transactions']:
-            desc = "Invoice" if trans['is_debit'] else "Credit memo"
+            # Properly determine description based on transaction type
+            if trans['is_debit']:
+                desc = "Invoice"
+            else:
+                # For credits, check the actual transaction type
+                if trans['type'] == 'payment':
+                    desc = "Payment"
+                elif trans['type'] == 'credit_note':
+                    desc = "Credit memo"
+                else:
+                    desc = "Credit"
+
             amount = trans['amount'] if trans['is_debit'] else -trans['amount']
             terms = "Net 30 Days"
 
@@ -866,6 +971,20 @@ UC - Unapplied Cash    RF - Refund"""
         # Transaction table with days past due
         table_data = [['INVOICED', 'DUE', 'INVOICE REFERENCES', 'CUSTOMER REF. NO.', 'INVOICE AMOUNT', 'BALANCE DUE', 'PAST DUE']]
 
+        # Add opening balance row if it exists and is non-zero (only for straight style)
+        opening_balance = statement_data.get('opening_balance', 0)
+        statement_style = statement_data.get('statement_style', 'straight')
+        if opening_balance > 0.01 and statement_style == 'straight':
+            table_data.append([
+                '',
+                '',
+                'OPENING BALANCE',
+                '',
+                '',
+                f"{opening_balance:,.2f}",
+                ''
+            ])
+
         today = datetime.now()
         for trans in statement_data['transactions']:
             days_past = (today - trans['date_obj']).days
@@ -906,13 +1025,25 @@ UC - Unapplied Cash    RF - Refund"""
 
         doc.build(story)
 
-    def _generate_statement_data(self, num_transactions=10):
-        """Generate complete statement data"""
+    def _generate_statement_data(self, num_transactions=10, statement_style=None):
+        """Generate complete statement data
+
+        Args:
+            num_transactions: Number of transactions to generate
+            statement_style: 'straight' or 'cumulative', if None randomly selected
+        """
         company = self.data_generator.generate_company()
         customer = self.data_generator.generate_customer()
 
+        # Randomly select statement style if not specified
+        # Mix of 'straight' (with opening balance row) and 'cumulative' (opening balance embedded in first transaction)
+        if statement_style is None:
+            statement_style = random.choice(['straight', 'cumulative'])
+
         opening_balance = random.uniform(0, 10000)
-        transactions, closing_balance = self.data_generator.generate_transactions(num_transactions, opening_balance)
+        transactions, closing_balance = self.data_generator.generate_transactions(
+            num_transactions, opening_balance, statement_style=statement_style
+        )
         aging = self.data_generator.calculate_aging(transactions)
 
         return {
@@ -920,18 +1051,21 @@ UC - Unapplied Cash    RF - Refund"""
             "customer": customer,
             "statement_number": f"{random.randint(10000, 99999)}",
             "statement_date": datetime.now().strftime("%d/%m/%Y"),
+            "statement_style": statement_style,
+            "opening_balance": opening_balance,
             "transactions": transactions,
             "total_due": closing_balance,
             "aging": aging
         }
 
-    def generate_batch(self, output_dir: str = "generated_statements", count: int = 25, save_ground_truth: bool = True):
+    def generate_batch(self, output_dir: str = "generated_statements", count: int = 25, save_ground_truth: bool = True, verify: bool = True):
         """Generate a batch of statements in various styles with ground truth
 
         Args:
             output_dir: Directory to save generated files
             count: Number of statements to generate
             save_ground_truth: If True, save JSON ground truth alongside each PDF
+            verify: If True, verify that ground truth matches statement data
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -943,7 +1077,14 @@ UC - Unapplied Cash    RF - Refund"""
             (self.generate_statement_style5, "BriggsEquipment"),
         ]
 
+        # Import verifier if needed
+        if verify and save_ground_truth:
+            from statement_verifier import StatementVerifier
+            verifier = StatementVerifier()
+
         generated = []
+        verification_failures = []
+
         for i in range(count):
             style_func, style_name = styles[i % len(styles)]
             output_path = os.path.join(output_dir, f"statement_{i+1:03d}_{style_name}.pdf")
@@ -962,12 +1103,46 @@ UC - Unapplied Cash    RF - Refund"""
                     with open(ground_truth_path, 'w') as f:
                         json.dump(ground_truth, f, indent=2, default=str)
 
+                    # Verify ground truth matches statement data
+                    if verify:
+                        all_passed, results = verifier.verify_statement(statement_data, ground_truth)
+                        if not all_passed:
+                            verification_failures.append({
+                                'file': output_path,
+                                'results': results
+                            })
+                            print(f"  ⚠ WARNING: Verification failed for {output_path}")
+                            failed_checks = [r for r in results if not r.passed]
+                            print(f"    {len(failed_checks)} checks failed")
+                        else:
+                            print(f"  ✓ Verification passed")
+
                 generated.append(output_path)
                 print(f"Generated: {output_path}")
                 if save_ground_truth:
                     print(f"  Ground truth: {ground_truth_path}")
             except Exception as e:
                 print(f"Error generating {output_path}: {e}")
+
+        # Print verification summary
+        if verify and save_ground_truth:
+            print("\n" + "="*70)
+            print("VERIFICATION SUMMARY")
+            print("="*70)
+            print(f"Total statements generated: {len(generated)}")
+            print(f"Verification passed: {len(generated) - len(verification_failures)}")
+            print(f"Verification failed: {len(verification_failures)}")
+
+            if verification_failures:
+                print("\n⚠ Files with verification failures:")
+                for failure in verification_failures:
+                    print(f"  - {failure['file']}")
+                    failed_checks = [r for r in failure['results'] if not r.passed]
+                    for check in failed_checks[:3]:  # Show first 3 failures
+                        print(f"    × {check.check_name}: {check.error_message}")
+            else:
+                print("\n✓ All statements verified successfully!")
+            print("="*70)
 
         return generated
 
@@ -994,6 +1169,7 @@ UC - Unapplied Cash    RF - Refund"""
             'metadata': {
                 'statement_number': statement_data.get('statement_number', ''),
                 'statement_date': statement_data.get('statement_date', ''),
+                'statement_style': statement_data.get('statement_style', 'straight'),
                 'pdf_style': style_name,
                 'generated_at': datetime.now().isoformat(),
             },
@@ -1009,6 +1185,7 @@ UC - Unapplied Cash    RF - Refund"""
                 'account': statement_data['customer']['account'],
             },
             'balances': {
+                'opening_balance': statement_data.get('opening_balance', 0),
                 'total_due': statement_data['total_due'],
                 'aging': statement_data['aging'],
             },
