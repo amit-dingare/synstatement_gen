@@ -3,69 +3,53 @@ Generate PDF versions of supplier statements for OCR testing
 Replicates realistic statement formats based on real-world examples
 """
 
-from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, HRFlowable
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT, TA_CENTER, TA_LEFT
-from reportlab.pdfgen import canvas
-from reportlab.graphics.shapes import Drawing, Rect, String
-from reportlab.graphics import renderPDF
 import json
 import os
 import random
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
-# Try to import dotenv for loading environment variables
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    print("python-dotenv not available, using system environment variables")
+    pass
 
-# Try to import OpenAI for realistic data generation
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
-    print("OpenAI not available, using fallback data generation")
 
 
 class RealisticDataGenerator:
-    """Generate realistic statement data using OpenAI or fallback methods"""
+    """Generate realistic statement data using LLMs"""
 
     def __init__(self, use_openai=True):
         self.use_openai = use_openai and OPENAI_AVAILABLE
+        self.client = None
+
         if self.use_openai:
             try:
                 self.client = OpenAI()
-            except Exception as e:
-                print(f"Failed to initialize OpenAI: {e}")
+            except Exception:
                 self.use_openai = False
 
-        # Fallback company data
-        self.companies = [
+        # Fallback data (only used if LLM generation fails)
+        self._fallback_companies = [
             {"name": "Northern Foods Supply Co.", "address": "1234 Industrial Blvd\nToronto ON M5V 2T6", "phone": "(416) 555-0123", "email": "ar@northernfoods.ca"},
             {"name": "Pacific Seafood Distributors", "address": "890 Harbor Drive\nVancouver BC V6B 4N9", "phone": "(604) 555-0456", "email": "accounts@pacificseafood.ca"},
-            {"name": "Prairie Grain Merchants Ltd.", "address": "456 Wheat Avenue\nWinnipeg MB R3C 0V8", "phone": "(204) 555-0789", "email": "billing@prairiegrain.ca"},
-            {"name": "Atlantic Dairy Products Inc.", "address": "321 Coastal Road\nHalifax NS B3J 1P3", "phone": "(902) 555-0321", "email": "finance@atlanticdairy.ca"},
-            {"name": "Mountain Fresh Produce Ltd.", "address": "567 Valley Road\nCalgary AB T2P 1J9", "phone": "(403) 555-0654", "email": "receivables@mountainfresh.ca"},
-            {"name": "Great Lakes Equipment Co.", "address": "789 Lakeshore Blvd\nHamilton ON L8P 4X1", "phone": "(905) 555-0987", "email": "ar@greatlakesequip.ca"},
-            {"name": "Quebec Artisan Foods", "address": "234 Rue Saint-Laurent\nMontreal QC H2Y 2Y3", "phone": "(514) 555-0234", "email": "comptes@quebecartisan.ca"},
-            {"name": "Western Machinery Parts", "address": "678 Industrial Park Way\nEdmonton AB T5J 3N8", "phone": "(780) 555-0567", "email": "billing@westernmachinery.ca"},
-            {"name": "Maritime Packaging Solutions", "address": "123 Shipyard Lane\nSaint John NB E2L 4L5", "phone": "(506) 555-0890", "email": "accounts@maritimepack.ca"},
-            {"name": "Central Canada Chemicals", "address": "345 Research Drive\nOttawa ON K1N 6N5", "phone": "(613) 555-0432", "email": "finance@centralchem.ca"},
         ]
 
-        self.customers = [
+        self._fallback_customers = [
             {"name": "SOBEYS INC.", "address": "115 King Street\nStellarton NS B0K 1S0", "account": "SOB001"},
             {"name": "METRO INC.", "address": "11011 Maurice-Duplessis Blvd\nMontreal QC H1C 1V6", "account": "MET002"},
-            {"name": "LOBLAWS COMPANIES", "address": "1 President's Choice Circle\nBrampton ON L6Y 5S5", "account": "LOB003"},
-            {"name": "COSTCO WHOLESALE", "address": "415 West Hunt Club Road\nOttawa ON K2E 1C5", "account": "COS004"},
-            {"name": "WALMART CANADA", "address": "1940 Argentia Road\nMississauga ON L5N 1P9", "account": "WAL005"},
         ]
 
         self.transaction_types = {
@@ -91,35 +75,55 @@ class RealisticDataGenerator:
         ]
 
     def generate_company(self):
-        """Generate realistic company data"""
-        if self.use_openai:
+        """Generate realistic company data using LLM"""
+        if self.use_openai and self.client:
             try:
                 response = self.client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[{
                         "role": "user",
-                        "content": """Generate a realistic Canadian business for a supplier statement. Return JSON with:
-                        {
-                            "name": "Company Name Ltd.",
-                            "address": "Street Address\\nCity Province PostalCode",
-                            "phone": "(XXX) XXX-XXXX",
-                            "email": "accounts@domain.ca",
-                            "website": "www.domain.ca"
-                        }
-                        Make it sound like a real food/manufacturing supplier."""
+                        "content": """Generate a realistic Canadian supplier business. Return ONLY valid JSON with this exact structure:
+{
+    "name": "Company Name Ltd.",
+    "address": "Street Address\\nCity Province PostalCode",
+    "phone": "(XXX) XXX-XXXX",
+    "email": "accounts@domain.ca"
+}
+Make it a food, manufacturing, or equipment supplier."""
                     }],
-                    max_tokens=200,
+                    max_tokens=150,
                     temperature=0.9
                 )
                 return json.loads(response.choices[0].message.content)
-            except Exception as e:
-                print(f"OpenAI error: {e}")
+            except Exception:
+                pass
 
-        return random.choice(self.companies)
+        return random.choice(self._fallback_companies)
 
     def generate_customer(self):
-        """Generate realistic customer data"""
-        return random.choice(self.customers)
+        """Generate realistic customer data using LLM"""
+        if self.use_openai and self.client:
+            try:
+                response = self.client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{
+                        "role": "user",
+                        "content": """Generate a realistic Canadian retail/wholesale customer. Return ONLY valid JSON with this exact structure:
+{
+    "name": "COMPANY NAME",
+    "address": "Street Address\\nCity Province PostalCode",
+    "account": "ABC001"
+}
+Use all caps for name. Make account a 6 character code."""
+                    }],
+                    max_tokens=150,
+                    temperature=0.9
+                )
+                return json.loads(response.choices[0].message.content)
+            except Exception:
+                pass
+
+        return random.choice(self._fallback_customers)
 
     def generate_transactions(self, num_transactions=10, opening_balance=0, statement_style='straight'):
         """Generate realistic transaction flow
